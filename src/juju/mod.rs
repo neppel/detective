@@ -4,8 +4,9 @@ use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
+use tokio_util::sync::CancellationToken;
 
-pub(crate) async fn debug(application: String) {
+pub(crate) async fn debug(application: String, token: CancellationToken) {
     let available_applications = list_applications().await;
     if !available_applications.contains(&application) {
         println!("unknown application: {}", application);
@@ -28,7 +29,7 @@ pub(crate) async fn debug(application: String) {
             let mut dispatch_script: String = "(echo $'".to_owned();
             dispatch_script.push_str(trace_function.as_str());
             dispatch_script.push_str(r#"';sed 's/    ops.main(/    sys.settrace(trace_function)\n    ops.main(/' ./src/charm.py;sed 's/    main(/    sys.settrace(trace_function)\n    main(/' ./src/charm.py;) | JUJU_DISPATCH_PATH='hooks/hook_name' PYTHONPATH=lib:venv /usr/bin/env python3 -"#);
-            debug_unit(unit, dispatch_script).await;
+            debug_unit(unit, dispatch_script, token.clone()).await;
         }
         _ => {
             println!("multiple units found for application: {}", application);
@@ -37,12 +38,14 @@ pub(crate) async fn debug(application: String) {
     }
 }
 
-async fn debug_unit(unit_name: &String, dispatch_script: String) {
-    let mut debug_hooks = Command::new("juju")
+async fn debug_unit(unit_name: &String, dispatch_script: String, token: CancellationToken) {
+    let mut pty = pty_process::Pty::new().unwrap();
+    pty.resize(pty_process::Size::new(24, 80)).unwrap();
+    let mut debug_hooks = pty_process::Command::new("juju")
         .args(["debug-hooks", unit_name])
-        .stdout(Stdio::piped())
-        .spawn()
+        .spawn(&pty.pts().unwrap())
         .unwrap();
+
     let mut child = Command::new("juju")
         .args(["ssh", unit_name, "bash"])
         .stdin(Stdio::piped())
@@ -50,55 +53,71 @@ async fn debug_unit(unit_name: &String, dispatch_script: String) {
         .spawn()
         .unwrap();
 
-    sleep(Duration::from_secs(10)).await;
+    sleep(Duration::from_secs(5)).await;
 
     let child_stdin = child.stdin.as_mut().unwrap();
-    let stdout = debug_hooks.stdout.as_mut().unwrap();
-
-    let mut content = "".to_owned();
     loop {
-        let command = format!("tmux send-keys -t {} \"env\" ENTER\n", unit_name);
-        let writing = child_stdin.write(command.as_bytes()).await;
-        match writing {
-            Ok(_) => (),
-            Err(error) => {
-                println!("error: {:?}", error);
-                break;
+        let mut content = "".to_owned();
+        loop {
+            if token.is_cancelled() {
+                println!("cancelling tasks for {}", unit_name);
+                child_stdin.write_all(b"exit\n").await.unwrap();
+                child.kill().await.unwrap();
+                debug_hooks.kill().await.unwrap();
+                // TODO: call juju resolve.
+                return;
             }
-        }
-
-        let mut buffer = Vec::new();
-        stdout.read_buf(&mut buffer).await.unwrap();
-        content.push_str(std::str::from_utf8(&buffer).unwrap());
-
-        if content.contains("JUJU_DISPATCH_PATH") {
-            let re = Regex::new(r"JUJU_DISPATCH_PATH=hooks/[a-z]*-*[a-z]*\u{001b}").unwrap();
-            let captures = re.captures(&content);
-            if let Some(captures) = captures {
-                let hook_name = captures
-                    .iter()
-                    .next()
-                    .expect("no captures found")
-                    .expect("no captures found")
-                    .as_str()
-                    .split("JUJU_DISPATCH_PATH=")
-                    .nth(1)
-                    .unwrap()
-                    .split('/')
-                    .nth(1)
-                    .unwrap()
-                    .split('\u{001b}')
-                    .next()
-                    .unwrap();
-                let patched_dispatch_script = dispatch_script.replace("hook_name", hook_name);
-                let command = format!(
-                    "tmux send-keys -t {} \"{}; exit\" ENTER\n",
-                    unit_name, patched_dispatch_script
-                );
-                child_stdin.write_all(command.as_bytes()).await.unwrap();
-                break;
+            let command = format!("tmux send-keys -t {} \"env\" ENTER\n", unit_name);
+            let writing = child_stdin.write(command.as_bytes()).await;
+            match writing {
+                Ok(_) => (),
+                Err(error) => {
+                    println!("error: {:?}", error);
+                    break;
+                }
             }
+
+            let mut buffer = Vec::new();
+            match pty.read_buf(&mut buffer).await {
+                Ok(_) => {}
+                Err(_) => {
+                    continue;
+                }
+            }
+            content.push_str(std::str::from_utf8(&buffer).unwrap());
+
+            if content.contains("JUJU_DISPATCH_PATH") {
+                let re = Regex::new(r"JUJU_DISPATCH_PATH=hooks/[a-z]*-*[a-z]*\u{001b}").unwrap();
+                let captures = re.captures(&content);
+                if let Some(captures) = captures {
+                    let hook_name = captures
+                        .iter()
+                        .next()
+                        .expect("no captures found")
+                        .expect("no captures found")
+                        .as_str()
+                        .split("JUJU_DISPATCH_PATH=")
+                        .nth(1)
+                        .unwrap()
+                        .split('/')
+                        .nth(1)
+                        .unwrap()
+                        .split('\u{001b}')
+                        .next()
+                        .unwrap();
+                    let patched_dispatch_script = dispatch_script.replace("hook_name", hook_name);
+                    let command = format!(
+                        "tmux send-keys -t {} \"{}; exit\" ENTER\n",
+                        unit_name, patched_dispatch_script
+                    );
+                    child_stdin.write_all(command.as_bytes()).await.unwrap();
+                    println!("{}: dispatching {} hook", unit_name, hook_name);
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
         }
+        sleep(Duration::from_secs(5)).await;
     }
 }
 
