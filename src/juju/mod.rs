@@ -3,10 +3,125 @@ use serde_json::Value;
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::select;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) async fn debug(application: String, token: CancellationToken) {
+async fn juju_status() -> Value {
+    match Command::new("juju").args(["version"]).spawn() {
+        Ok(_) => (),
+        Err(e) => {
+            if let std::io::ErrorKind::NotFound = e.kind() {
+                println!("`juju` was not found in your PATH");
+                std::process::exit(1);
+            }
+            println!("some strange error occurred");
+            std::process::exit(1);
+        }
+    }
+
+    let status = Command::new("juju")
+        .args(["status", "--format=json"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let new_status = status.wait_with_output().await.unwrap();
+
+    let data = std::str::from_utf8(&new_status.stdout).unwrap();
+
+    let value: Value = serde_json::from_str(data).unwrap();
+
+    value
+}
+
+async fn list_applications() -> Vec<String> {
+    let status = juju_status().await;
+
+    let mut applications = Vec::new();
+
+    for (application_name, _) in status["applications"].as_object().unwrap() {
+        applications.push(application_name.to_owned());
+    }
+
+    applications
+}
+
+async fn list_units(application: &str) -> Vec<String> {
+    let value = juju_status().await;
+
+    let mut units = Vec::new();
+
+    for (application_name, application_data) in value["applications"].as_object().unwrap() {
+        if application_name == application {
+            for (unit_name, _) in application_data["units"].as_object().unwrap() {
+                units.push(unit_name.to_owned());
+            }
+        }
+    }
+
+    units
+}
+
+pub(crate) async fn pause(application: String, token: CancellationToken) {
+    let available_applications = list_applications().await;
+    if !available_applications.contains(&application) {
+        println!("unknown application: {}", application);
+        std::process::exit(1);
+    }
+    let units = list_units(&application).await;
+    let mut pause_hooks = Vec::new();
+    for unit in units.clone() {
+        let pty = pty_process::Pty::new().unwrap();
+        pty.resize(pty_process::Size::new(24, 80)).unwrap();
+        pause_hooks.push(
+            pty_process::Command::new("juju")
+                .args(["debug-hooks", unit.as_str()])
+                .spawn(&pty.pts().unwrap())
+                .unwrap(),
+        );
+        println!("paused unit: {}", unit.as_str());
+        sleep(Duration::from_secs(1)).await;
+    }
+    println!("press ctrl+c to resume units");
+    select! {
+        _ = token.cancelled() => {
+            println!("resume units");
+        }
+    }
+    for mut hook in pause_hooks {
+        hook.kill().await.unwrap();
+    }
+    for unit in units {
+        Command::new("juju")
+            .args([
+                "ssh",
+                unit.as_str(),
+                "tmux",
+                "kill-session",
+                "-t",
+                unit.as_str(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+        Command::new("juju")
+            .args(["resolve", unit.as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+    }
+}
+
+pub(crate) async fn trace(application: String, token: CancellationToken) {
     let available_applications = list_applications().await;
     if !available_applications.contains(&application) {
         println!("unknown application: {}", application);
@@ -29,7 +144,7 @@ pub(crate) async fn debug(application: String, token: CancellationToken) {
             let mut dispatch_script: String = "(echo $'".to_owned();
             dispatch_script.push_str(trace_function.as_str());
             dispatch_script.push_str(r#"';sed 's/    ops.main(/    sys.settrace(trace_function)\n    ops.main(/' ./src/charm.py;sed 's/    main(/    sys.settrace(trace_function)\n    main(/' ./src/charm.py;) | JUJU_DISPATCH_PATH='hooks/hook_name' PYTHONPATH=lib:venv /usr/bin/env python3 -"#);
-            debug_unit(unit, dispatch_script, token.clone()).await;
+            trace_unit(unit, dispatch_script, token.clone()).await;
         }
         _ => {
             println!("multiple units found for application: {}", application);
@@ -38,7 +153,7 @@ pub(crate) async fn debug(application: String, token: CancellationToken) {
     }
 }
 
-async fn debug_unit(unit_name: &String, dispatch_script: String, token: CancellationToken) {
+async fn trace_unit(unit_name: &String, dispatch_script: String, token: CancellationToken) {
     let mut pty = pty_process::Pty::new().unwrap();
     pty.resize(pty_process::Size::new(24, 80)).unwrap();
     let mut debug_hooks = pty_process::Command::new("juju")
@@ -64,7 +179,24 @@ async fn debug_unit(unit_name: &String, dispatch_script: String, token: Cancella
                 child_stdin.write_all(b"exit\n").await.unwrap();
                 child.kill().await.unwrap();
                 debug_hooks.kill().await.unwrap();
-                // TODO: call juju resolve.
+                Command::new("juju")
+                    .args(["ssh", unit_name, "tmux", "kill-session", "-t", unit_name])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap()
+                    .wait_with_output()
+                    .await
+                    .unwrap();
+                Command::new("juju")
+                    .args(["resolve", unit_name])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap()
+                    .wait_with_output()
+                    .await
+                    .unwrap();
                 return;
             }
             let command = format!("tmux send-keys -t {} \"env\" ENTER\n", unit_name);
@@ -119,60 +251,4 @@ async fn debug_unit(unit_name: &String, dispatch_script: String, token: Cancella
         }
         sleep(Duration::from_secs(5)).await;
     }
-}
-
-async fn list_applications() -> Vec<String> {
-    let status = juju_status().await;
-
-    let mut applications = Vec::new();
-
-    for (application_name, _) in status["applications"].as_object().unwrap() {
-        applications.push(application_name.to_owned());
-    }
-
-    applications
-}
-
-async fn list_units(application: &str) -> Vec<String> {
-    let value = juju_status().await;
-
-    let mut units = Vec::new();
-
-    for (application_name, application_data) in value["applications"].as_object().unwrap() {
-        if application_name == application {
-            for (unit_name, _) in application_data["units"].as_object().unwrap() {
-                units.push(unit_name.to_owned());
-            }
-        }
-    }
-
-    units
-}
-
-async fn juju_status() -> Value {
-    match Command::new("juju").args(["version"]).spawn() {
-        Ok(_) => (),
-        Err(e) => {
-            if let std::io::ErrorKind::NotFound = e.kind() {
-                println!("`juju` was not found in your PATH");
-                std::process::exit(1);
-            }
-            println!("some strange error occurred");
-            std::process::exit(1);
-        }
-    }
-
-    let status = Command::new("juju")
-        .args(["status", "--format=json"])
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    let new_status = status.wait_with_output().await.unwrap();
-
-    let data = std::str::from_utf8(&new_status.stdout).unwrap();
-
-    let value: Value = serde_json::from_str(data).unwrap();
-
-    value
 }
