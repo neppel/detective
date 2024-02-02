@@ -1,4 +1,4 @@
-use crate::juju::debug;
+use crate::juju::{pause, trace};
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
@@ -12,11 +12,23 @@ async fn main() {
         let engine = std::env::args()
             .nth(1)
             .expect("no engine given (should be one of: juju)");
-        let application = std::env::args().nth(2).expect("no application given");
+        let operation = std::env::args()
+            .nth(2)
+            .expect("no operation given (should be one of: pause, trace)");
+        let application = std::env::args().nth(3).expect("no application given");
         match engine.as_str() {
-            "juju" => {
-                debug(application, token_clone).await;
-            }
+            "juju" => match operation.as_str() {
+                "pause" => {
+                    pause(application, token_clone).await;
+                }
+                "trace" => {
+                    trace(application, token_clone).await;
+                }
+                _ => {
+                    println!("unknown operation: {}", operation);
+                    std::process::exit(1);
+                }
+            },
             _ => {
                 println!("unknown engine: {}", engine);
                 std::process::exit(1);
